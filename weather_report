@@ -1,0 +1,188 @@
+#! /bin/bash
+
+#### CONFIG ####
+WEATHER_FILE=$HOME/.weather_report
+WEATHER_URL="http://www.nws.noaa.gov/data/PQR/SFTPQR"
+CITY="PORTLAND"
+################
+
+
+# FUNCTIONS
+
+# gets first of pair separated by /
+get_first(){
+	local first="$1"
+	local result=$(echo  $first | awk -F / '{print $1}')
+	if  [[ -z $result ]] ; then 
+		echo "MM"
+	else
+		echo $result | tr -d [:blank:]
+	fi		
+}
+	
+# gets second of pair separated by /
+get_second(){
+	local second="$1"
+	local result=$(echo  $second | awk -F / '{print $2}')
+	if  [[ -z $result ]] ; then 
+		echo "MM"
+	else
+		echo $result | tr -d [:blank:]
+	fi		
+}
+	
+f_to_c(){
+	echo "$(echo "($1 -32)/1.8" | bc)"
+}
+
+output_chart(){
+	local array="$1"
+	local file="$2"
+        eval "echo "\${$array[@]}"" | spark >> $file
+}	
+
+output_table(){
+        local title="$1"
+        local array="$2"
+        local file="$3"
+        printf "%13s" "$title " >> $file
+        for val in $(eval echo "\${$array[@]}"); do
+                printf "%-7s" "$val"
+        done >> $file
+}
+
+
+# get weather function
+get_weather(){
+	local file="$1" 
+	local url="$2"
+	local city="$3"
+	local tmpfile="${file}.tmp"
+	time=$(date +%s)
+
+	if ! touch $tmpfile &>/dev/null; then
+		echo "unable to write temp file: ${tmpfile}!"
+		return 1
+	fi
+        if ! touch ${tmpfile}.${time} &>/dev/null; then 
+                echo "unable to write temp file: ${tmpfile}.${time}!"
+                return 1
+        fi
+
+	if ! touch $file &>/dev/null; then 
+		echo "unable to write to file: ${file}!"
+		return 1
+	fi
+
+	if ! curl --silent $url > ${tmpfile}.${time}; then
+		echo "could not fetch forecast $url"
+		rm ${tmpfile}.{$time}
+		return 1
+	fi
+	# date 
+	cat ${tmpfile}.${time}  | sed -n 21p | cut -d" " -f4-7 >$tmpfile
+	# weather data
+	cat ${tmpfile}.${time} | grep -A 3 "^   $city" | sed -n 2,5p >>$tmpfile
+	rm ${tmpfile}.${time}
+
+	
+	#build array of weather stats (my_weather[0] == date)
+	declare -a my_weather
+	x=0
+	while read line ;do
+		my_weather[$x]="$line"
+		let x++
+	done < $tmpfile
+	
+	rm $tmpfile
+
+	# set forecast date
+	local forecast_date=${my_weather[0]}
+
+	# set days of week
+	for day in $(seq 0 6); do
+		local days_of_week=(${days_of_week[@]} "$(date -d "$forecast_date $day  days" +%a)")
+	done
+
+	# Set Conditions
+	for condition in ${my_weather[1]}; do 
+		local conditions=(${conditions[@]} "$condition")
+	done 	
+
+	# Set High and Low Temp
+	for temp in ${my_weather[2]}; do 
+		local lt=$(get_first $temp)
+		local ht=$(get_second $temp)
+		
+		local lowtempF=(${lowtempF[@]} "$lt")
+		local hightempF=(${hightempF[@]} "$ht")
+
+		if [[  "$lt" =~ [^0-9] ]] ; then
+                        lt="$lt"
+                else   
+                        lt="$lt/$(f_to_c $lt)"
+                fi
+
+                if [[  "$ht" =~ [^0-9] ]] ; then
+                        ht="$ht"
+                else
+                        ht="$ht/$(f_to_c $ht)"
+                fi
+
+		local lowtempC=(${lowtempC[@]} "$lt")
+		local hightempC=(${hightempC[@]} "$ht")
+	done
+
+	# Set Rainfall Prediction. Day/Night as %
+	for percentage in ${my_weather[3]}; do 
+		local night_rain=(${night_rain[@]} "$(get_first $percentage)")
+		local day_rain=(${day_rain[@]} "$(get_second $percentage)")
+	done
+
+	# clean up file in preparation for writing
+	rm -f ${file}
+	
+	# Print days of week
+	output_table " " days_of_week $file
+	printf "\n" >> $file
+
+	# Print conditions
+	output_table "summary" conditions $file
+	printf "\n" >> $file
+
+	# Print high and low temp 
+	output_table "max temp" hightempC $file
+	output_chart hightempF $file
+	output_table "min temp" lowtempC $file
+	output_chart lowtempF $file
+
+	# Output % chance of rain
+	output_table  "day rain %" day_rain $file
+	output_chart day_rain $file
+	output_table  "night rain %" night_rain $file
+	output_chart  night_rain $file
+}
+
+# MAIN
+
+if [[ ! -s $WEATHER_FILE  ]]; then
+	get_weather $WEATHER_FILE $WEATHER_URL $CITY
+elif [[  $(( $(date +%s) - $(stat -c %Y $WEATHER_FILE ))) -gt 10800 ]] ; then 
+	get_weather $WEATHER_FILE $WEATHER_URL $CITY
+fi
+
+cat $WEATHER_FILE
+
+declare -A my_weather_now
+while read line ;do  
+	key=$(echo "$line" | cut -d: -f1)
+	value=$(echo "$line" | cut -d: -f2| tr -d "\n")
+	my_weather_now["$key"]="$value"
+done < <(weather --quiet -i kpdx)	
+
+printf "%17s" "temp"
+printf "%s\n" "${my_weather_now[Temperature]}  sky conditions:${my_weather_now["Sky conditions"]}"
+printf "%17s" "wind"
+printf "%s\n" "${my_weather_now[Wind]}"	
+
+printf "%50s\n" "$(date)"
